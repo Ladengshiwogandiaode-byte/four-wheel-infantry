@@ -1,0 +1,213 @@
+//
+// Created by ningj on 2026/10/9.
+//
+
+#include <librm.hpp>
+
+#include "can.h"
+#include "usart.h"
+#include "math.h"
+
+extern "C" {
+volatile float rb = 0.0f;
+volatile float lb = 0.0f;
+volatile float rf = 0.0f;
+volatile float lf = 0.0f;
+volatile int x = 0.0f;
+volatile int y = 0.0f;
+volatile uint32_t rc_ok = 0;
+volatile uint32_t motors_ok = 0;
+volatile uint32_t control_enable = 0;
+volatile uint32_t loop_counter = 0;
+volatile uint32_t init_step = 0;
+volatile uint32_t boot_step = 0;
+volatile uint32_t error_from_step = 0;
+volatile uint32_t clock_status = 0;
+volatile uint32_t rc_rx_any_count = 0;
+volatile uint32_t rc_rx_18_count = 0;
+}
+
+namespace {
+
+constexpr float kSin45 = 0.70710678f;
+constexpr float kDt = 0.001f;
+constexpr float kEncoderPerRad = 8192.0f / (2.0f * 3.1415926);
+
+rm::hal::Serial<36> dbus{huart3, false, true};
+rm::device::DR16 rc{dbus};
+
+// Do not construct DjiMotor objects as global objects.  Their constructors
+// touch DjiMotorBase::tx_buf_, whose static initialization order is not
+// guaranteed across translation units.  They are allocated in UserInit()
+// after all static constructors have completed.
+rm::hal::Can *can1 = nullptr;
+rm::hal::Can *can2 = nullptr;
+
+rm::device::GM6020 *steer_lf = nullptr;
+rm::device::GM6020 *steer_rf = nullptr;
+rm::device::GM6020 *steer_rb = nullptr;
+rm::device::GM6020 *steer_lb = nullptr;
+
+rm::device::M3508 *wheel_lf = nullptr;
+rm::device::M3508 *wheel_rf = nullptr;
+rm::device::M3508 *wheel_rb = nullptr;
+rm::device::M3508 *wheel_lb = nullptr;
+
+While_TypeDef while_lf;
+While_TypeDef while_rf;
+While_TypeDef while_rb;
+While_TypeDef while_lb;
+
+rm::modules::PID pid_while1(5.0f, 0.0f, 0.0f, 16384.0f, 0.0f);
+rm::modules::PID pid_while2(5.0f, 0.0f, 0.0f, 16384.0f, 0.0f);
+rm::modules::PID pid_while3(5.0f, 0.0f, 0.0f, 16384.0f, 0.0f);
+rm::modules::PID pid_while4(5.0f, 0.0f, 0.0f, 16384.0f, 0.0f);
+
+rm::modules::PID pid_steer1(5.0f, 0.0f, 0.0f, 30000.0f, 0.0f);
+rm::modules::PID pid_steer2(5.0f, 0.0f, 0.0f, 30000.0f, 0.0f);
+rm::modules::PID pid_steer3(5.0f, 0.0f, 0.0f, 30000.0f, 0.0f);
+rm::modules::PID pid_steer4(5.0f, 0.0f, 0.0f, 30000.0f, 0.0f);
+
+}  // namespace
+
+extern "C" void UserInit(void) {
+    init_step = 1;
+
+    dbus.AttachRxCallback([](etl::span<const rm::u8> data) {
+        rc_rx_any_count++;
+        if (data.size() == 18) {
+            rc_rx_18_count++;
+        }
+    });
+
+    can1 = new rm::hal::Can(hcan1);
+    can2 = new rm::hal::Can(hcan2);
+
+    can1->SetFilter(0, 0);
+    can1->Begin();
+
+    can2->SetFilter(0, 0);
+    can2->Begin();
+
+    init_step = 2;
+
+    steer_lf = new rm::device::GM6020(*can2, 1);
+    steer_rf = new rm::device::GM6020(*can2, 2);
+    steer_rb = new rm::device::GM6020(*can2, 3);
+    steer_lb = new rm::device::GM6020(*can2, 4);
+
+    wheel_lf = new rm::device::M3508(*can2, 1);
+    wheel_rf = new rm::device::M3508(*can2, 2);
+    wheel_rb = new rm::device::M3508(*can2, 3);
+    wheel_lb = new rm::device::M3508(*can2, 4);
+
+    init_step = 3;
+
+    pid_steer1.SetCircular(true).SetCircularCycle(8192.0f);
+    pid_steer2.SetCircular(true).SetCircularCycle(8192.0f);
+    pid_steer3.SetCircular(true).SetCircularCycle(8192.0f);
+    pid_steer4.SetCircular(true).SetCircularCycle(8192.0f);
+
+    rc.SetHeartbeatTimeout(std::chrono::milliseconds(100));
+    rc.Begin();
+
+    init_step = 4;
+}
+
+extern "C" void UserMain() {
+    loop_counter++;
+
+    if (can1 == nullptr || can2 == nullptr || steer_lf == nullptr ||
+        steer_rf == nullptr || steer_rb == nullptr || steer_lb == nullptr ||
+        wheel_lf == nullptr || wheel_rf == nullptr || wheel_rb == nullptr ||
+        wheel_lb == nullptr) {
+        return;
+    }
+
+    rc_ok = (rc.online_status() == rm::device::Device::kOk) ? 1U : 0U;
+    motors_ok = (steer_lf->online_status() == rm::device::Device::kOk) &&
+                (steer_rf->online_status() == rm::device::Device::kOk) &&
+                (steer_rb->online_status() == rm::device::Device::kOk) &&
+                (steer_lb->online_status() == rm::device::Device::kOk) &&
+                (wheel_lf->online_status() == rm::device::Device::kOk) &&
+                (wheel_rf->online_status() == rm::device::Device::kOk) &&
+                (wheel_rb->online_status() == rm::device::Device::kOk) &&
+                (wheel_lb->online_status() == rm::device::Device::kOk);
+    control_enable = rc_ok && motors_ok;
+
+    x = static_cast<float>(rc.left_x());
+    y = static_cast<float>(rc.left_y());
+
+    if (!control_enable) {
+        steer_lf->SetCurrent(0);
+        steer_rf->SetCurrent(0);
+        steer_rb->SetCurrent(0);
+        steer_lb->SetCurrent(0);
+        wheel_lf->SetCurrent(0);
+        wheel_rf->SetCurrent(0);
+        wheel_rb->SetCurrent(0);
+        wheel_lb->SetCurrent(0);
+        rm::device::DjiMotorBase::SendCommand();
+        return;
+    }
+
+    const float Vx = static_cast<float>(rc.left_x()) / 660.0f * 1000.0f;
+    const float Vy = static_cast<float>(rc.left_y()) / 660.0f * 1000.0f;
+    const float Vw = 0.0f;
+
+    while_lf.target_v = sqrtf((Vx + Vw * kSin45) * (Vx + Vw * kSin45) +
+                              (Vy + Vw * kSin45) * (Vy + Vw * kSin45));
+    while_rf.target_v = sqrtf((Vx + Vw * kSin45) * (Vx + Vw * kSin45) +
+                              (Vy - Vw * kSin45) * (Vy - Vw * kSin45));
+    while_rb.target_v = sqrtf((Vx - Vw * kSin45) * (Vx - Vw * kSin45) +
+                              (Vy - Vw * kSin45) * (Vy - Vw * kSin45));
+    while_lb.target_v = sqrtf((Vx - Vw * kSin45) * (Vx - Vw * kSin45) +
+                              (Vy + Vw * kSin45) * (Vy + Vw * kSin45));
+
+    while_lf.w_angle = atan2f(Vy + Vw * kSin45, Vx + Vw * kSin45);
+    while_rf.w_angle = atan2f(Vy - Vw * kSin45, Vx + Vw * kSin45);
+    while_rb.w_angle = atan2f(Vy - Vw * kSin45, Vx - Vw * kSin45);
+    while_lb.w_angle = atan2f(Vy + Vw * kSin45, Vx - Vw * kSin45);
+
+    while_lf.target_encoder = while_lf.w_angle * kEncoderPerRad;
+    while_rf.target_encoder = while_rf.w_angle * kEncoderPerRad;
+    while_rb.target_encoder = while_rb.w_angle * kEncoderPerRad;
+    while_lb.target_encoder = while_lb.w_angle * kEncoderPerRad;
+
+    lf = static_cast<float>(steer_lf->encoder());
+    lb = static_cast<float>(steer_lb->encoder());
+    rf = static_cast<float>(steer_rf->encoder());
+    rb = static_cast<float>(steer_rb->encoder());
+
+    while_lf.fact_v = static_cast<float>(wheel_lf->rpm());
+    while_rf.fact_v = static_cast<float>(wheel_rf->rpm());
+    while_rb.fact_v = static_cast<float>(wheel_rb->rpm());
+    while_lb.fact_v = static_cast<float>(wheel_lb->rpm());
+
+    while_rb.encoder = static_cast<float>(steer_rb->encoder()) - 1114.0f;
+    while_lb.encoder = static_cast<float>(steer_lb->encoder()) - 3111.0f;
+    while_rf.encoder = static_cast<float>(steer_rf->encoder()) - 2912.0f;
+    while_lf.encoder = static_cast<float>(steer_lf->encoder()) - 2274.0f;
+
+    pid_steer1.Update(while_lb.target_encoder, while_lb.encoder, kDt);
+    pid_steer2.Update(while_rf.target_encoder, while_rf.encoder, kDt);
+    pid_steer3.Update(while_rb.target_encoder, while_rb.encoder, kDt);
+    pid_steer4.Update(while_lf.target_encoder, while_lf.encoder, kDt);
+
+    pid_while1.Update(while_lb.target_v, while_lb.fact_v, kDt);
+    pid_while2.Update(while_rb.target_v, while_rb.fact_v, kDt);
+    pid_while3.Update(while_rf.target_v, while_rf.fact_v, kDt);
+    pid_while4.Update(while_lf.target_v, while_lf.fact_v, kDt);
+
+    steer_lf->SetCurrent(static_cast<int16_t>(pid_steer4.out()));
+    steer_rf->SetCurrent(static_cast<int16_t>(pid_steer2.out()));
+    steer_lb->SetCurrent(static_cast<int16_t>(pid_steer1.out()));
+    steer_rb->SetCurrent(static_cast<int16_t>(pid_steer3.out()));
+
+    wheel_lb->SetCurrent(static_cast<int16_t>(pid_while1.out()));
+    wheel_lf->SetCurrent(static_cast<int16_t>(pid_while4.out()));
+    wheel_rb->SetCurrent(static_cast<int16_t>(pid_while2.out()));
+    wheel_rf->SetCurrent(static_cast<int16_t>(pid_while3.out()));
+
+    rm::device::DjiMotorBase::SendCommand();
+}

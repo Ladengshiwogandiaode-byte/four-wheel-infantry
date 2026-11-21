@@ -1,0 +1,27 @@
+# ????
+build/
+cmake-build-*/
+out/
+
+# IDE
+.idea/
+*.iml
+
+# ??/??
+*.bak
+*.orig
+*~
+*.autosave
+$null
+
+# ????
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.su
+
+# ??????
+*.git_off
